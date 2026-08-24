@@ -1,0 +1,15 @@
+{
+  "platform": "twitter",
+  "account_age_days": 20,
+  "followers_count": 5,
+  "friends_count": 1800,
+  "statuses_count": 0,
+  "description_length": 0,
+  "username_digit_ratio": 0.6,
+  "average_tweets_per_day": 0,
+  "verified": 0,
+  "geo_enabled": 0,
+  "default_profile": 1,
+  "favourites_count": 0,
+  "has_profile_pic": 0
+}
