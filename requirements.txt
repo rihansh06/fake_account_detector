@@ -1,6 +1,6 @@
-scikit-learn>=1.7.2
-pandas==2.2.2
-joblib==1.4.2
-flask==3.0.3
-flask-cors==4.0.1
- 
+flask
+flask-cors
+joblib
+pandas
+scikit-learn
+gunicorn
