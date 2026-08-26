@@ -48,7 +48,12 @@ def extract_username(url_or_username: str, platform: str) -> str:
 
 
 def scrape_instagram(username: str) -> dict:
-    L = instaloader.Instaloader()
+    L = instaloader.Instaloader(
+        max_connection_attempts=1,  # don't retry — fail fast instead of hanging
+        request_timeout=15,
+        sleep=False,  # disable automatic sleep-and-retry on rate limits
+    )
+
     profile = instaloader.Profile.from_username(L.context, username)
 
     full_name = profile.full_name or ""
@@ -88,7 +93,13 @@ def fetch_twitter(username: str) -> dict:
 
     d = body["data"]
 
-    created_at = datetime.strptime(d["createdAt"], "%a %b %d %H:%M:%S %z %Y")
+    raw_created_at = d["createdAt"]
+    try:
+        # Classic Twitter format, e.g. "Thu Dec 13 08:41:26 +0000 2007"
+        created_at = datetime.strptime(raw_created_at, "%a %b %d %H:%M:%S %z %Y")
+    except ValueError:
+        # ISO 8601 format, e.g. "2009-06-02T20:12:29.000000Z"
+        created_at = datetime.strptime(raw_created_at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
     account_age_days = (datetime.now(timezone.utc) - created_at).days
     account_age_days = max(account_age_days, 1)  # avoid div-by-zero
 
@@ -240,6 +251,11 @@ def analyze_instagram():
         features = scrape_instagram(username)
     except instaloader.exceptions.ProfileNotExistsException:
         return jsonify({"error": f"No such Instagram profile: {username}"}), 404
+    except instaloader.exceptions.TooManyRequestsException:
+        return jsonify({
+            "error": "Instagram rate-limited this server (common for cloud-hosted IPs). "
+                     "Try again later, or use pre-fetched demo data for this platform."
+        }), 429
     except Exception as e:
         return jsonify({"error": f"Couldn't fetch Instagram profile: {e}"}), 502
 
