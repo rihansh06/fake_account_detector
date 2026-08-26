@@ -19,12 +19,101 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import joblib
 import pandas as pd
+import re
+import os
+from datetime import datetime, timezone
+import instaloader
+import requests
 
 app = Flask(__name__)
 CORS(app)
 
 instagram_model = joblib.load("instagram_model.joblib")
 twitter_model = joblib.load("twitter_model.joblib")
+
+# Set this as an environment variable on Render (Settings > Environment).
+# Get a free key + 100k credits at https://twitterapi.io
+TWITTERAPI_IO_KEY = os.environ.get("TWITTERAPI_IO_KEY", "")
+
+
+def extract_username(url_or_username: str, platform: str) -> str:
+    """Pulls a bare username out of a full profile URL, or returns it as-is."""
+    if platform == "instagram":
+        match = re.search(r"instagram\.com/([^/?]+)", url_or_username)
+    else:  # twitter/x
+        match = re.search(r"(?:twitter|x)\.com/([^/?]+)", url_or_username)
+    if match:
+        return match.group(1)
+    return url_or_username.strip().lstrip("@")
+
+
+def scrape_instagram(username: str) -> dict:
+    L = instaloader.Instaloader()
+    profile = instaloader.Profile.from_username(L.context, username)
+
+    full_name = profile.full_name or ""
+    bio = profile.biography or ""
+    digit_ratio = (sum(c.isdigit() for c in username) / len(username)) if username else 0
+    fullname_digit_ratio = (sum(c.isdigit() for c in full_name) / len(full_name)) if full_name else 0
+
+    return {
+        "profile pic": 1 if profile.profile_pic_url else 0,
+        "nums/length username": round(digit_ratio, 3),
+        "fullname words": len(full_name.split()) if full_name else 0,
+        "nums/length fullname": round(fullname_digit_ratio, 3),
+        "name==username": 1 if full_name.lower() == username.lower() else 0,
+        "description length": len(bio),
+        "external URL": 1 if profile.external_url else 0,
+        "private": 1 if profile.is_private else 0,
+        "#posts": profile.mediacount,
+        "#followers": profile.followers,
+        "#follows": profile.followees,
+    }
+
+
+def fetch_twitter(username: str) -> dict:
+    if not TWITTERAPI_IO_KEY:
+        raise RuntimeError("TWITTERAPI_IO_KEY environment variable is not set")
+
+    resp = requests.get(
+        "https://api.twitterapi.io/twitter/user/info",
+        params={"userName": username},
+        headers={"X-API-Key": TWITTERAPI_IO_KEY},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get("status") != "success":
+        raise RuntimeError(body.get("msg", "twitterapi.io request failed"))
+
+    d = body["data"]
+
+    created_at = datetime.strptime(d["createdAt"], "%a %b %d %H:%M:%S %z %Y")
+    account_age_days = (datetime.now(timezone.utc) - created_at).days
+    account_age_days = max(account_age_days, 1)  # avoid div-by-zero
+
+    username_val = d.get("userName", username)
+    digit_ratio = (sum(c.isdigit() for c in username_val) / len(username_val)) if username_val else 0
+    description = d.get("description", "") or ""
+    statuses_count = d.get("statusesCount", 0)
+
+    return {
+        "account_age_days": account_age_days,
+        "followers_count": d.get("followers", 0),
+        "friends_count": d.get("following", 0),
+        "statuses_count": statuses_count,
+        "description_length": len(description),
+        "username_digit_ratio": round(digit_ratio, 3),
+        "average_tweets_per_day": round(statuses_count / account_age_days, 3),
+        "verified": 1 if d.get("isBlueVerified") else 0,
+        # twitterapi.io doesn't expose these two — default to 0.
+        # They were low-importance features in training (see README),
+        # so this doesn't meaningfully hurt accuracy.
+        "geo_enabled": 0,
+        "default_profile": 0,
+        "favourites_count": d.get("favouritesCount", 0),
+        "has_profile_pic": 1 if d.get("profilePicture") else 0,
+    }
 
 INSTAGRAM_RAW_COLUMNS = [
     "profile pic",
@@ -135,6 +224,68 @@ def predict():
         "verdict": "fake" if pred == 1 else "real",
         "confidence": round(float(max(probabilities)), 3),
         "fake_probability": round(float(probabilities[1]), 3),
+    })
+
+
+@app.route("/analyze/instagram", methods=["POST"])
+def analyze_instagram():
+    data = request.get_json(force=True)
+    raw = data.get("username") or data.get("url")
+    if not raw:
+        return jsonify({"error": "Provide 'username' or 'url'"}), 400
+
+    username = extract_username(raw, "instagram")
+
+    try:
+        features = scrape_instagram(username)
+    except instaloader.exceptions.ProfileNotExistsException:
+        return jsonify({"error": f"No such Instagram profile: {username}"}), 404
+    except Exception as e:
+        return jsonify({"error": f"Couldn't fetch Instagram profile: {e}"}), 502
+
+    row = dict(features)
+    row["follower_following_ratio"] = row["#followers"] / (row["#follows"] + 1)
+    df = pd.DataFrame([row])[INSTAGRAM_MODEL_COLUMN_ORDER]
+    pred = instagram_model.predict(df)[0]
+    proba = instagram_model.predict_proba(df)[0]
+
+    return jsonify({
+        "platform": "instagram",
+        "username": username,
+        "verdict": "fake" if pred == 1 else "real",
+        "confidence": round(float(max(proba)), 3),
+        "fake_probability": round(float(proba[1]), 3),
+        "extracted_features": features,
+    })
+
+
+@app.route("/analyze/twitter", methods=["POST"])
+def analyze_twitter():
+    data = request.get_json(force=True)
+    raw = data.get("username") or data.get("url")
+    if not raw:
+        return jsonify({"error": "Provide 'username' or 'url'"}), 400
+
+    username = extract_username(raw, "twitter")
+
+    try:
+        features = fetch_twitter(username)
+    except Exception as e:
+        return jsonify({"error": f"Couldn't fetch Twitter profile: {e}"}), 502
+
+    row = dict(features)
+    row["follower_following_ratio"] = row["followers_count"] / (row["friends_count"] + 1)
+    df = pd.DataFrame([row])[TWITTER_MODEL_COLUMN_ORDER]
+    pred = twitter_model.predict(df)[0]
+    proba = twitter_model.predict_proba(df)[0]
+
+    return jsonify({
+        "platform": "twitter",
+        "username": username,
+        "verdict": "fake" if pred == 1 else "real",
+        "confidence": round(float(max(proba)), 3),
+        "fake_probability": round(float(proba[1]), 3),
+        "extracted_features": features,
     })
 
 
